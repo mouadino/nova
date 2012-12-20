@@ -53,7 +53,7 @@ class DbPoolTestCase(test.TestCase):
             def connect(self, *args, **kwargs):
                 raise test.TestingException()
 
-        self.stubs.Set(db_pool, 'ConnectionPool',
+        self.stubs.Set(session, '_ConnectionPool',
                 FakeConnectionPool)
 
         sql_connection = 'mysql://user:pass@127.0.0.1/nova'

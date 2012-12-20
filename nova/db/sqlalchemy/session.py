@@ -185,6 +185,10 @@ sql_opts = [
                default='sqlite:///$state_path/$sqlite_db',
                help='The SQLAlchemy connection string used to connect to the '
                     'database'),
+    cfg.ListOpt('extra_sql_connections',
+               default=[],
+               help='List of SQLAlchemy connection strings of redundant '
+                    'databases to failover.'),
     cfg.StrOpt('sqlite_db',
                default='nova.sqlite',
                help='the filename to use with sqlite'),
@@ -392,6 +396,41 @@ def is_db_connection_error(args):
     return False
 
 
+def _get_connection_maker(db_driver, connection_args):
+    "Return a function to use as ``SQLAlchemy.pool.Pool``'s creator."
+    # XXX (mouad): The code bellow will try to (re)-connect to the first
+    # available server w/o engine knowledge i.e. ``engine.url`` may contain
+    # the wrong url.
+    db_backends = connection_args.pop('dbs')
+    total_tries = len(db_backends)
+
+    def connect():
+        for i, db in enumerate(db_backends, start=1):
+            try:
+                return db_driver.connect(**db)
+            except db_driver.OperationalError as ex:
+                LOG.warn('SQL connection failed for %s.', db['host'])
+                if is_db_connection_error(str(ex.args[0])) and i < total_tries:
+                    continue
+                raise
+    return connect
+
+
+class _ConnectionPool(db_pool.ConnectionPool):
+    "Extend ``eventlet.db_pool.ConnectionPool`` with failover."
+
+    @classmethod
+    def connect(cls, db_driver, conn_timeout, *args, **kwargs):
+        "Override ``Connection.Pool`` connect to use a failover connect."
+        from eventlet import timeout, tpool
+        t = timeout.Timeout(conn_timeout, db_pool.ConnectTimeout())
+        try:
+            conn = tpool.execute(_get_connection_maker(db_driver, kwargs))
+            return tpool.Proxy(conn, autowrap_names=('cursor',))
+        finally:
+            t.cancel()
+
+
 def create_engine(sql_connection):
     """Return a new SQLAlchemy engine."""
     connection_dict = sqlalchemy.engine.url.make_url(sql_connection)
@@ -414,21 +453,37 @@ def create_engine(sql_connection):
         if CONF.sql_connection == "sqlite://":
             engine_args["poolclass"] = StaticPool
             engine_args["connect_args"] = {'check_same_thread': False}
-    elif all((CONF.sql_dbpool_enable, MySQLdb,
-            "mysql" in connection_dict.drivername)):
-        LOG.info(_("Using mysql/eventlet db_pool."))
-        # MySQLdb won't accept 'None' in the password field
-        password = connection_dict.password or ''
-        pool_args = {
-                'db': connection_dict.database,
-                'passwd': password,
-                'host': connection_dict.host,
-                'user': connection_dict.username,
+    elif MySQLdb and "mysql" in connection_dict.drivername:
+        db_backends = [{
+            'db': connection_dict.database,
+            # MySQLdb won't accept 'None' in the password field
+            'passwd': connection_dict.password or '',
+            'host': connection_dict.host,
+            'user': connection_dict.username,
+        }]
+        # Add MySQL cluster of failover db backends.
+        for conn in CONF.extra_sql_connections:
+            conn = sqlalchemy.engine.url.make_url(conn)
+            db_backends.append({
+                'db': conn.database,
+                'passwd': conn.password or '',
+                'host': conn.host,
+                'user': conn.username,
+            })
+        connection_args = {'dbs': db_backends}
+        if CONF.sql_dbpool_enable:
+            LOG.info(_("Using mysql/eventlet db_pool."))
+            connection_args.update({
                 'min_size': CONF.sql_min_pool_size,
                 'max_size': CONF.sql_max_pool_size,
-                'max_idle': CONF.sql_idle_timeout}
-        creator = db_pool.ConnectionPool(MySQLdb, **pool_args)
-        engine_args['creator'] = creator.create
+                'max_idle': CONF.sql_idle_timeout
+            })
+            creator = _ConnectionPool(MySQLdb, **connection_args)
+            engine_args['creator'] = creator.create
+        else:
+            engine_args['creator'] = _get_connection_maker(
+                MySQLdb, connection_args
+            )
     else:
         engine_args['pool_size'] = CONF.sql_max_pool_size
         if CONF.sql_max_overflow is not None:
